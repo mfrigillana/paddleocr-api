@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: paddleocr-api
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        generateValue: true

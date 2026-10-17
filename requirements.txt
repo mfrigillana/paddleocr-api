@@ -1,0 +1,7 @@
+rapidocr_onnxruntime==1.4.4
+onnxruntime==1.31.0
+opencv-python==5.0.0.93
+numpy==2.5.4
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20
