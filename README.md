@@ -9,6 +9,15 @@ so it fits in Render's free 512 MB instance. Tested peak ~410 MB on a 12 MP, 60-
 
 Returns `{"text": "...", "lines": [{"text", "confidence", "box"}]}`.
 
+## Telegram bot
+
+Send the bot a photo; it replies with the text.
+
+1. In Telegram, message @BotFather, send /newbot, copy the token.
+2. In Render > paddleocr-api > Environment, add `TELEGRAM_BOT_TOKEN` = that token. Save (it redeploys).
+3. The service registers its own webhook on boot. Message your bot to get your chat ID.
+4. Add `TELEGRAM_ALLOWED_CHAT_IDS` = your chat ID(s), comma-separated, so only you/staff can use it.
+
 ## Settings (env vars)
 
 | Var | Default | Note |
@@ -17,6 +26,8 @@ Returns `{"text": "...", "lines": [{"text", "confidence", "box"}]}`.
 | MAX_SIDE | 1280 | Images are downscaled to this before OCR. |
 | DET_LIMIT | 736 | Detector input size. Raising it raises RAM. |
 | MAX_BYTES | 8388608 | Upload limit. |
+| TELEGRAM_BOT_TOKEN | (none) | Enables the bot. |
+| TELEGRAM_ALLOWED_CHAT_IDS | (none) | Comma-separated. Empty = anyone can use it. |
 
 ## Free tier limits
 
