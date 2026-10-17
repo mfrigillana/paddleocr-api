@@ -57,66 +57,152 @@ async def lifespan(_app):
 app = FastAPI(title="PaddleOCR API", lifespan=lifespan)
 
 
-def ocr_bytes(data: bytes) -> dict:
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
+def ocr_image(data: bytes):
+    """Returns (lines in working-image coords, full-res image, scale full->working)."""
+    full = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if full is None:
         raise ValueError("not an image (jpg/png/webp/bmp)")
-    h, w = img.shape[:2]
-    if max(h, w) > MAX_SIDE:
-        s = MAX_SIDE / max(h, w)
-        img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    h, w = full.shape[:2]
+    scale = min(1.0, MAX_SIDE / max(h, w))
+    img = full if scale == 1.0 else cv2.resize(full, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     with lock:
         result = engine(img, use_cls=USE_CLS)[0]
+    del img
     lines = [
         {"text": t, "confidence": round(float(c), 4), "box": [[int(x), int(y)] for x, y in b]}
         for b, t, c in (result or [])
     ]
+    return lines, full, scale
+
+
+def ocr_bytes(data: bytes) -> dict:
+    lines, _, _ = ocr_image(data)
     return {"text": "\n".join(l["text"] for l in lines), "lines": lines}
 
 
 NUM = re.compile(r"^\d{1,7}\.\d{2}$")
+PRICE = re.compile(r"^\d{2,3}\.\d{2}$")
 STAMP = re.compile(r"(\d{4}/\d{2}/\d{2})\s*(\d{2}:\d{2})")
 
 
-def pump_readings(lines: list) -> dict | None:
-    """Pump panel photo -> {reading_time, pumps:[{name, litres, price}]}. Top row = litres, row below = price."""
-    nums = []
-    for l in lines:
-        t = l["text"].replace(" ", "")
-        if NUM.match(t):
-            ys = [p[1] for p in l["box"]]
-            xs = [p[0] for p in l["box"]]
-            nums.append({"v": t, "x": sum(xs) / 4, "y": sum(ys) / 4, "h": max(ys) - min(ys)})
-    if len(nums) < 4:
+def _tok(l: dict) -> dict:
+    xs = [p[0] for p in l["box"]]
+    ys = [p[1] for p in l["box"]]
+    return {"t": l["text"].replace(" ", ""), "raw": l["text"], "conf": l["confidence"],
+            "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+            "cx": sum(xs) / 4, "cy": sum(ys) / 4, "h": max(ys) - min(ys), "w": max(xs) - min(xs)}
+
+
+def _reread(full, tok: dict, scale: float) -> str | None:
+    """Re-read one LCD number from a full-resolution crop around its box (wider, to catch missed digits)."""
+    if full is None:
         return None
-    nums.sort(key=lambda n: n["y"])
-    rows, cur = [], [nums[0]]
-    for n in nums[1:]:
-        if abs(n["y"] - cur[-1]["y"]) < 0.6 * max(n["h"], cur[-1]["h"]):
-            cur.append(n)
+    H, W = full.shape[:2]
+    best = None
+    for padx, pady in ((0.12, 0.25), (0.25, 0.35), (0.06, 0.15)):
+        x0 = int(max(0, (tok["x0"] - padx * tok["w"]) / scale))
+        x1 = int(min(W, (tok["x1"] + padx * tok["w"]) / scale))
+        y0 = int(max(0, (tok["y0"] - pady * tok["h"]) / scale))
+        y1 = int(min(H, (tok["y1"] + pady * tok["h"]) / scale))
+        crop = full[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # Close small gaps between LCD segments so digits read as solid strokes.
+        dark = cv2.bitwise_not(gray)
+        dark = cv2.dilate(dark, np.ones((3, 3), np.uint8), iterations=1)
+        variants = [crop, cv2.cvtColor(cv2.bitwise_not(dark), cv2.COLOR_GRAY2BGR)]
+        for v in variants:
+            with lock:
+                res = engine(v, use_det=False, use_cls=False)[0]
+            text, score = (res[0][0], float(res[0][1])) if res else ("", 0.0)
+            t = text.replace(" ", "")
+            if NUM.match(t) and (best is None or score > best[1]):
+                best = (t, score)
+    return best[0] if best else None
+
+
+def pump_readings(lines: list, full=None, scale: float = 1.0) -> dict | None:
+    """Pump panel photo -> {reading_time, pumps:[{name, litres|None, price, raw}]}.
+    Prices are the anchor (they read reliably); each pump's litres is the number directly above its price."""
+    toks = [_tok(l) for l in lines]
+    for t in toks:  # LCD price read without its decimal point, e.g. "9700" -> "97.00"
+        if re.fullmatch(r"\d{4}", t["t"]) and 2000 <= int(t["t"]) <= 30000:
+            t["t"] = t["t"][:-2] + "." + t["t"][-2:]
+    prices = [t for t in toks if PRICE.match(t["t"]) and 20 <= float(t["t"]) <= 300]
+    if len(prices) < 2:
+        return None
+    prices.sort(key=lambda t: t["cy"])
+    rows, cur = [], [prices[0]]
+    for t in prices[1:]:
+        if abs(t["cy"] - cur[-1]["cy"]) < 0.6 * max(t["h"], cur[-1]["h"]):
+            cur.append(t)
         else:
             rows.append(cur)
-            cur = [n]
+            cur = [t]
     rows.append(cur)
-    if len(rows) < 2 or len(rows[0]) < 2 or len(rows[0]) != len(rows[1]):
+    row = max(rows, key=len)
+    if len(row) < 2:
         return None
-    litres = sorted(rows[0], key=lambda n: n["x"])
-    prices = sorted(rows[1], key=lambda n: n["x"])
+    row.sort(key=lambda t: t["cx"])
+
+    pumps = []
+    for i, P in enumerate(row):
+        above = [t for t in toks if t is not P and t["cy"] < P["cy"] and P["cy"] - t["cy"] < 3 * P["h"]
+                 and t["x1"] > P["x0"] - P["w"] and t["x0"] < P["x1"] + 0.5 * P["w"]
+                 and sum(c.isdigit() for c in t["t"]) >= 4]
+        L = max(above, key=lambda t: t["cy"]) if above else None
+        litres = None
+        if L is not None:
+            if NUM.match(L["t"]) and L["conf"] >= 0.9:
+                litres = L["t"]
+            else:
+                litres = _reread(full, L, scale) or (L["t"] if NUM.match(L["t"]) else None)
+        pumps.append({"name": PUMP_LABELS[i] if i < len(PUMP_LABELS) else f"Pump {i + 1}",
+                      "litres": float(litres) if litres else None,
+                      "price": float(P["t"]), "raw": L["raw"] if L else ""})
+
     stamp = None
     for l in lines:
         m = STAMP.search(l["text"].replace(" ", ""))
         if m:
             stamp = f"{m.group(1)} {m.group(2)}"
             break
-    pumps = [{"name": PUMP_LABELS[i] if i < len(PUMP_LABELS) else f"Pump {i + 1}",
-              "litres": float(L["v"]), "price": float(P["v"])}
-             for i, (L, P) in enumerate(zip(litres, prices))]
     return {"reading_time": stamp, "pumps": pumps}
 
 
+MANUAL = re.compile(r"^\s*(.+?)\s+([\d,]+\.\d{1,2})\s+(\d{2,3}(?:\.\d{1,2})?)\s*$")
+
+
+def manual_readings(text: str) -> dict | None:
+    """Typed correction, one pump per line: '<pump> <litres> <price>', e.g. 'Regular 65815.01 97.50'."""
+    names = {n.lower(): n for n in PUMP_LABELS}
+    pumps = []
+    for line in text.strip().splitlines():
+        m = MANUAL.match(line)
+        if not m or m.group(1).strip().lower() not in names:
+            return None
+        pumps.append({"name": names[m.group(1).strip().lower()],
+                      "litres": float(m.group(2).replace(",", "")), "price": float(m.group(3))})
+    return {"reading_time": None, "pumps": pumps} if pumps else None
+
+
 def format_readings(r: dict) -> str:
+    if all(p["litres"] is None for p in r["pumps"]):
+        prices = ", ".join(f"{p['name']} ₱{p['price']:.2f}" for p in r["pumps"])
+        return (f"I can see the prices ({prices}) but not the meter totals, so nothing was saved.\n"
+                "Show the totalizer (L) screen on each pump, then take the photo again.")
     out = [f"Reading: {r['reading_time']}"] if r["reading_time"] else []
-    out += [f"{p['name']}: {p['litres']:,.2f} L @ ₱{p['price']:.2f}/L" for p in r["pumps"]]
+    bad = []
+    for p in r["pumps"]:
+        if p["litres"] is None:
+            out.append(f"{p['name']}: couldn't read the meter (saw \"{p.get('raw', '')}\")")
+            bad.append(p)
+        else:
+            out.append(f"{p['name']}: {p['litres']:,.2f} L @ ₱{p['price']:.2f}/L")
+    if bad:
+        out.append("\nNot saved for the pump(s) above. Retake the photo, or reply with the meter value:")
+        out += [f"{p['name']} <litres> {p['price']:.2f}" for p in bad]
     return "\n".join(out)
 
 
@@ -125,6 +211,9 @@ async def log_to_sheet(r: dict, msg: dict) -> str:
     if not SHEET_URL:
         return ""
     sender = msg.get("from") or {}
+    r = {**r, "pumps": [p for p in r["pumps"] if p["litres"] is not None]}
+    if not r["pumps"]:
+        return ""
     payload = {**r, "message_id": f"tg{msg['chat']['id']}_{msg.get('message_id')}",
                "sent_by": sender.get("username") or sender.get("first_name") or ""}
     try:
@@ -166,7 +255,8 @@ async def ocr(file: UploadFile = File(...), x_api_key: str = Header(default=""))
 
 # ---------------- Telegram ----------------
 
-HELP = ("Send me a photo of a document and I'll reply with the text.\n"
+HELP = ("Send me a photo of the pump meters and I'll read and log them.\n"
+        "To enter a reading by hand: Regular 65815.01 97.50 (one pump per line).\n"
         "Tip: send it as a File (not compressed) for small print.")
 
 
@@ -212,18 +302,25 @@ async def handle_message(msg: dict):
         return
 
     if not file_id:
-        await tg_reply(chat_id, f"{HELP}\n\nYour chat ID: {chat_id}")
+        r = manual_readings(msg.get("text") or "")
+        if r:
+            await tg_reply(chat_id, format_readings(r) + await log_to_sheet(r, msg), mid)
+        else:
+            await tg_reply(chat_id, f"{HELP}\n\nYour chat ID: {chat_id}")
         return
 
     try:
         await tg("sendChatAction", chat_id=chat_id, action="typing")
         data = await tg_download(file_id)
-        result = await run_in_threadpool(ocr_bytes, data)
-        r = pump_readings(result["lines"])
+        def work():
+            lines, full, scale = ocr_image(data)
+            return lines, pump_readings(lines, full, scale)
+
+        lines, r = await run_in_threadpool(work)
         if r:
             reply = format_readings(r) + await log_to_sheet(r, msg)
         else:
-            reply = result["text"] or "No text found."
+            reply = "\n".join(l["text"] for l in lines) or "No text found."
         await tg_reply(chat_id, reply, mid)
     except Exception as e:
         print("telegram OCR error:", repr(e))
