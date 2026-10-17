@@ -1,6 +1,7 @@
 """PaddleOCR (PP-OCRv4 via ONNX Runtime) API + Telegram bot, sized for Render's free tier (512 MB RAM)."""
 import hashlib
 import os
+from datetime import datetime, timedelta, timezone
 import re
 import threading
 from contextlib import asynccontextmanager
@@ -93,36 +94,105 @@ def _tok(l: dict) -> dict:
             "cx": sum(xs) / 4, "cy": sum(ys) / 4, "h": max(ys) - min(ys), "w": max(xs) - min(xs)}
 
 
-def _reread(full, tok: dict, scale: float) -> str | None:
-    """Re-read one LCD number from a full-resolution crop around its box (wider, to catch missed digits)."""
+def _reread(full, tok: dict, scale: float) -> list:
+    """Re-read one LCD number from full-resolution crops around its box. Returns every text seen.
+    Extra room on the right: a final thin "1" is the digit most often dropped."""
     if full is None:
-        return None
+        return []
     H, W = full.shape[:2]
-    best = None
-    for padx, pady in ((0.12, 0.25), (0.25, 0.35), (0.06, 0.15)):
-        x0 = int(max(0, (tok["x0"] - padx * tok["w"]) / scale))
-        x1 = int(min(W, (tok["x1"] + padx * tok["w"]) / scale))
+    texts = []
+    for padl, padr, pady in ((0.10, 0.30, 0.25), (0.05, 0.15, 0.15), (0.15, 0.45, 0.35)):
+        x0 = int(max(0, (tok["x0"] - padl * tok["w"]) / scale))
+        x1 = int(min(W, (tok["x1"] + padr * tok["w"]) / scale))
         y0 = int(max(0, (tok["y0"] - pady * tok["h"]) / scale))
         y1 = int(min(H, (tok["y1"] + pady * tok["h"]) / scale))
         crop = full[y0:y1, x0:x1]
         if crop.size == 0:
             continue
+        if crop.shape[0] < 64:
+            f = 64 / crop.shape[0]
+            crop = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        # Close small gaps between LCD segments so digits read as solid strokes.
-        dark = cv2.bitwise_not(gray)
-        dark = cv2.dilate(dark, np.ones((3, 3), np.uint8), iterations=1)
-        variants = [crop, cv2.cvtColor(cv2.bitwise_not(dark), cv2.COLOR_GRAY2BGR)]
-        for v in variants:
+        solid = cv2.erode(gray, np.ones((3, 3), np.uint8), iterations=1)  # join LCD segments
+        for v in (crop, cv2.cvtColor(solid, cv2.COLOR_GRAY2BGR)):
             with lock:
                 res = engine(v, use_det=False, use_cls=False)[0]
-            text, score = (res[0][0], float(res[0][1])) if res else ("", 0.0)
-            t = text.replace(" ", "")
-            if NUM.match(t) and (best is None or score > best[1]):
-                best = (t, score)
-    return best[0] if best else None
+            if res and res[0][0]:
+                texts.append(res[0][0])
+    return texts
 
 
-def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | None = None) -> dict | None:
+MAX_PER_DAY = float(os.getenv("MAX_LITRES_PER_DAY", "3000"))
+PH_TZ = timezone(timedelta(hours=8))
+
+
+def stamp_ms(stamp: str | None) -> int:
+    if stamp:
+        try:
+            return int(datetime.strptime(stamp, "%Y/%m/%d %H:%M").replace(tzinfo=PH_TZ).timestamp() * 1000)
+        except ValueError:
+            pass
+    return int(datetime.now(PH_TZ).timestamp() * 1000)
+
+
+def _candidates(texts: list, first_conf: float, exp_digits: int | None = None) -> list:
+    """Possible totalizer values from OCR text. Lower score = more trusted. (value, score, filled_in)"""
+    out = {}
+    exp_n = exp_digits or 7
+    # If any read has every digit, the meter was seen in full: never invent a digit.
+    complete = any(len(re.sub(r"\D", "", x)) >= exp_n for x in texts)
+
+    def add(v, sc, filled):
+        if v not in out or sc < out[v][0]:
+            out[v] = (sc, filled)
+
+    for i, raw in enumerate(texts):
+        t = raw.replace(" ", "")
+        d = re.sub(r"\D", "", t)
+        base = 0.0 if i == 0 and first_conf >= 0.9 else 0.5
+        if NUM.match(t):
+            add(float(t), base, False)
+        full_len = len(d) == exp_digits if exp_digits else len(d) >= 7
+        if full_len:  # the tiny decimal point is often missed; totalizers always show 2 decimals
+            add(float(d[:-2] + "." + d[-2:]), base + 1, False)
+        short = (len(d) == exp_digits - 1) if exp_digits else (len(d) == 6 or re.search(r"\.\d$", t))
+        if short and not complete:  # exactly one digit missed, most often a thin "1" at the end
+            for pos in range(len(d) + 1):
+                for x in "0123456789":
+                    nd = d[:pos] + x + d[pos:]
+                    add(float(nd[:-2] + "." + nd[-2:]), base + 3 + (0 if x == "1" else 1) + (0 if pos == len(d) else 0.5), True)
+    return [(v, sc, f) for v, (sc, f) in out.items()]
+
+
+def _pick(cands: list, hist: list, t_ms: int):
+    """Choose the reading that fits the meter history (meters only go up, by a plausible amount)."""
+    if not cands:
+        return None, "unreadable"
+    if hist:
+        before = [v for t, v in hist if t < t_ms]
+        after = [v for t, v in hist if t > t_ms]
+        prev = max(before) if before else None
+        nxt = min(after) if after else None
+        t_prev = max((t for t, _ in hist if t < t_ms), default=None)
+        t_next = min((t for t, _ in hist if t > t_ms), default=None)
+        d_prev = max(1.0, (t_ms - t_prev) / 86400000) if t_prev else 1.0
+        d_next = max(1.0, (t_next - t_ms) / 86400000) if t_next else 1.0
+
+        def ok(v):
+            return ((prev is None or prev <= v <= prev + MAX_PER_DAY * d_prev)
+                    and (nxt is None or nxt - MAX_PER_DAY * d_next <= v <= nxt))
+
+        good = sorted((c for c in cands if ok(c[0])), key=lambda c: c[1])
+        if good:
+            return good[0], None
+        return None, "doesn't fit the previous reading"
+    # No history yet: only trust clean reads or a missed decimal point.
+    safe = sorted((c for c in cands if c[1] <= 1.5), key=lambda c: c[1])
+    return (safe[0], None) if safe else (None, "unclear")
+
+
+def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | None = None,
+                  history: dict | None = None) -> dict | None:
     """Pump panel photo -> {reading_time, pumps:[{name, litres|None, price, raw}]}.
     Prices are the anchor (they read reliably); each pump's litres is the number directly above its price."""
     toks = [_tok(l) for l in lines]
@@ -160,29 +230,46 @@ def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | Non
         if len(set(slots)) != len(slots):
             slots = list(range(len(row)))
 
-    found = {}
-    for slot, P in zip(slots, row):
-        above = [t for t in toks if t is not P and t["cy"] < P["cy"] and P["cy"] - t["cy"] < 3 * P["h"]
-                 and t["x1"] > P["x0"] - P["w"] and t["x0"] < P["x1"] + 0.5 * P["w"]
-                 and sum(c.isdigit() for c in t["t"]) >= 4]
-        L = max(above, key=lambda t: t["cy"]) if above else None
-        litres = None
-        if L is not None:
-            if NUM.match(L["t"]) and L["conf"] >= 0.9:
-                litres = L["t"]
-            else:
-                litres = _reread(full, L, scale) or (L["t"] if NUM.match(L["t"]) else None)
-        found[slot] = {"name": PUMP_LABELS[slot], "litres": float(litres) if litres else None,
-                       "price": float(P["t"]), "raw": L["raw"] if L else ""}
-    pumps = [found.get(i, {"name": PUMP_LABELS[i], "litres": None, "price": None, "raw": ""})
-             for i in range(n)]
-
     stamp = None
     for l in lines:
         m = STAMP.search(l["text"].replace(" ", ""))
         if m:
             stamp = f"{m.group(1)} {m.group(2)}"
             break
+    t_ms = stamp_ms(stamp)
+
+    def lit_tok(P):
+        above = [t for t in toks if t is not P and t["cy"] < P["cy"] and P["cy"] - t["cy"] < 3 * P["h"]
+                 and t["x1"] > P["x0"] - P["w"] and t["x0"] < P["x1"] + 0.5 * P["w"]
+                 and sum(c.isdigit() for c in t["t"]) >= 4]
+        return max(above, key=lambda t: t["cy"]) if above else None
+
+    found = {}
+    for slot, P in zip(slots, row):
+        name = PUMP_LABELS[slot]
+        # How many digits this meter should show: from its history, else from other clean reads on the photo.
+        h = (history or {}).get(name, [])
+        if h:
+            exp = len(f"{max(v for _, v in h):.2f}".replace(".", ""))
+        else:
+            lens = [len(re.sub(r"\D", "", t["t"])) for t in (lit_tok(Q) for Q in row)
+                    if t and NUM.match(t["t"]) and t["conf"] >= 0.9]
+            exp = max(set(lens), key=lens.count) if lens else None
+        L = lit_tok(P)
+        choice, why = None, "not found"
+        if L is not None:
+            texts = [L["raw"]]
+            if not (NUM.match(L["t"]) and L["conf"] >= 0.9):
+                texts += _reread(full, L, scale)
+            choice, why = _pick(_candidates(texts, L["conf"], exp), (history or {}).get(name, []), t_ms)
+            if choice is None and len(texts) == 1:  # clean read rejected by history: look again
+                texts += _reread(full, L, scale)
+                choice, why = _pick(_candidates(texts, L["conf"], exp), (history or {}).get(name, []), t_ms)
+        found[slot] = {"name": name, "litres": choice[0] if choice else None,
+                       "filled": bool(choice and choice[2]), "why": why,
+                       "price": float(P["t"]), "raw": L["raw"] if L else ""}
+    pumps = [found.get(i, {"name": PUMP_LABELS[i], "litres": None, "price": None, "raw": ""})
+             for i in range(n)]
     return {"reading_time": stamp, "pumps": pumps}
 
 
@@ -192,18 +279,22 @@ MANUAL = re.compile(r"^\s*(.+?)\s+([\d,]+\.\d{1,2})\s+(\d{2,3}(?:\.\d{1,2})?)\s*
 def manual_readings(text: str) -> dict | None:
     """Typed correction, one pump per line: '<pump> <litres> <price>', e.g. 'Regular 65815.01 97.50'."""
     names = {n.lower(): n for n in PUMP_LABELS}
-    pumps = []
+    pumps, stamp = [], None
     for line in text.strip().splitlines():
+        m = STAMP.fullmatch(line.strip().replace(" ", "")) if not pumps and stamp is None else None
+        if m:  # optional first line: 2026/10/07 18:02
+            stamp = f"{m.group(1)} {m.group(2)}"
+            continue
         m = MANUAL.match(line)
         if not m or m.group(1).strip().lower() not in names:
             return None
         pumps.append({"name": names[m.group(1).strip().lower()],
                       "litres": float(m.group(2).replace(",", "")), "price": float(m.group(3))})
-    return {"reading_time": None, "pumps": pumps} if pumps else None
+    return {"reading_time": stamp, "pumps": pumps} if pumps else None
 
 
 def format_readings(r: dict) -> str:
-    if all(p["litres"] is None for p in r["pumps"]):
+    if all(p["litres"] is None and not p.get("raw") for p in r["pumps"]):
         prices = ", ".join(f"{p['name']} ₱{p['price']:.2f}" for p in r["pumps"] if p["price"])
         return (f"I can see the prices ({prices}) but not the meter totals, so nothing was saved.\n"
                 "Show the totalizer (L) screen on each pump, then take the photo again.")
@@ -211,14 +302,34 @@ def format_readings(r: dict) -> str:
     bad = []
     for p in r["pumps"]:
         if p["litres"] is None:
-            out.append(f"{p['name']}: couldn't read the meter" + (f" (saw \"{p['raw']}\")" if p.get("raw") else ""))
+            if p.get("why") == "doesn't fit the previous reading":
+                out.append(f"{p['name']}: read \"{p['raw']}\" but it doesn't fit the readings in the sheet")
+            else:
+                out.append(f"{p['name']}: couldn't read the meter" + (f" (saw \"{p['raw']}\")" if p.get("raw") else ""))
             bad.append(p)
         else:
-            out.append(f"{p['name']}: {p['litres']:,.2f} L @ ₱{p['price']:.2f}/L")
+            out.append(f"{p['name']}: {p['litres']:,.2f} L{'*' if p.get('filled') else ''} @ ₱{p['price']:.2f}/L")
+    if any(p.get("filled") for p in r["pumps"]):
+        out.append("* one faint digit was filled in to match the meter history")
     if bad:
+        if any(p.get("why") == "doesn't fit the previous reading" for p in bad) and not r["reading_time"]:
+            out.append("\nThis photo has no date stamp, so it was checked against the latest reading."
+                       " Older photos need the camera's date stamp.")
         out.append("\nNot saved for the pump(s) above. Retake the photo, or reply with the meter value:")
         out += [f"{p['name']} <litres> {p['price']:.2f}" if p["price"] else f"{p['name']} <litres> <price>" for p in bad]
     return "\n".join(out)
+
+
+async def sheet_history() -> dict:
+    """Per-pump [[time ms, totalizer], ...] from the sheet; {} if unavailable."""
+    if not SHEET_URL:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            return (await c.get(SHEET_URL)).json().get("history", {})
+    except Exception as e:
+        print("sheet history failed:", repr(e))
+        return {}
 
 
 async def log_to_sheet(r: dict, msg: dict) -> str:
@@ -244,7 +355,11 @@ async def log_to_sheet(r: dict, msg: dict) -> str:
         return "\n\nAlready in sheet."
     lines = ["\n\nSaved to sheet."]
     for s in res.get("sold", []):
-        if s.get("litres") != "":
+        if s.get("litres") == "":
+            continue
+        if s["litres"] < 0:
+            lines.append(f"{s['pump']}: lower than the previous reading, please check")
+        else:
             lines.append(f"{s['pump']} since last: {s['litres']:,.2f} L = ₱{s['sales']:,.2f}")
     return "\n".join(lines)
 
@@ -272,6 +387,7 @@ async def ocr(file: UploadFile = File(...), x_api_key: str = Header(default=""))
 
 HELP = ("Send me a photo of the pump meters and I'll read and log them.\n"
         "To enter a reading by hand: Regular 65815.01 97.50 (one pump per line).\n"
+        "For a past reading, put the date first: 2026/10/07 18:02 on its own line.\n"
         "Tip: send it as a File (not compressed) for small print.")
 
 
@@ -327,9 +443,11 @@ async def handle_message(msg: dict):
     try:
         await tg("sendChatAction", chat_id=chat_id, action="typing")
         data = await tg_download(file_id)
+        history = await sheet_history()
+
         def work():
             lines, full, scale = ocr_image(data)
-            return lines, pump_readings(lines, full, scale)
+            return lines, pump_readings(lines, full, scale, history=history)
 
         lines, r = await run_in_threadpool(work)
         if r:
