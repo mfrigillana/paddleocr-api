@@ -122,7 +122,7 @@ def _reread(full, tok: dict, scale: float) -> str | None:
     return best[0] if best else None
 
 
-def pump_readings(lines: list, full=None, scale: float = 1.0) -> dict | None:
+def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | None = None) -> dict | None:
     """Pump panel photo -> {reading_time, pumps:[{name, litres|None, price, raw}]}.
     Prices are the anchor (they read reliably); each pump's litres is the number directly above its price."""
     toks = [_tok(l) for l in lines]
@@ -144,10 +144,24 @@ def pump_readings(lines: list, full=None, scale: float = 1.0) -> dict | None:
     row = max(rows, key=len)
     if len(row) < 2:
         return None
+    n = len(PUMP_LABELS)
+    if len(row) > n:  # keep the big price screens
+        row = sorted(row, key=lambda t: t["h"], reverse=True)[:n]
     row.sort(key=lambda t: t["cx"])
 
-    pumps = []
-    for i, P in enumerate(row):
+    # Fixed layout: left-to-right is always PUMP_LABELS (Regular, Premium, Diesel).
+    # If a pump's price wasn't found, place the others by which third of the photo they sit in.
+    if len(row) == n:
+        slots = list(range(n))
+    else:
+        if width is None:
+            width = (full.shape[1] * scale) if full is not None else max(t["x1"] for t in toks)
+        slots = [min(n - 1, int(P["cx"] / (width / n))) for P in row]
+        if len(set(slots)) != len(slots):
+            slots = list(range(len(row)))
+
+    found = {}
+    for slot, P in zip(slots, row):
         above = [t for t in toks if t is not P and t["cy"] < P["cy"] and P["cy"] - t["cy"] < 3 * P["h"]
                  and t["x1"] > P["x0"] - P["w"] and t["x0"] < P["x1"] + 0.5 * P["w"]
                  and sum(c.isdigit() for c in t["t"]) >= 4]
@@ -158,9 +172,10 @@ def pump_readings(lines: list, full=None, scale: float = 1.0) -> dict | None:
                 litres = L["t"]
             else:
                 litres = _reread(full, L, scale) or (L["t"] if NUM.match(L["t"]) else None)
-        pumps.append({"name": PUMP_LABELS[i] if i < len(PUMP_LABELS) else f"Pump {i + 1}",
-                      "litres": float(litres) if litres else None,
-                      "price": float(P["t"]), "raw": L["raw"] if L else ""})
+        found[slot] = {"name": PUMP_LABELS[slot], "litres": float(litres) if litres else None,
+                       "price": float(P["t"]), "raw": L["raw"] if L else ""}
+    pumps = [found.get(i, {"name": PUMP_LABELS[i], "litres": None, "price": None, "raw": ""})
+             for i in range(n)]
 
     stamp = None
     for l in lines:
@@ -189,20 +204,20 @@ def manual_readings(text: str) -> dict | None:
 
 def format_readings(r: dict) -> str:
     if all(p["litres"] is None for p in r["pumps"]):
-        prices = ", ".join(f"{p['name']} ₱{p['price']:.2f}" for p in r["pumps"])
+        prices = ", ".join(f"{p['name']} ₱{p['price']:.2f}" for p in r["pumps"] if p["price"])
         return (f"I can see the prices ({prices}) but not the meter totals, so nothing was saved.\n"
                 "Show the totalizer (L) screen on each pump, then take the photo again.")
     out = [f"Reading: {r['reading_time']}"] if r["reading_time"] else []
     bad = []
     for p in r["pumps"]:
         if p["litres"] is None:
-            out.append(f"{p['name']}: couldn't read the meter (saw \"{p.get('raw', '')}\")")
+            out.append(f"{p['name']}: couldn't read the meter" + (f" (saw \"{p['raw']}\")" if p.get("raw") else ""))
             bad.append(p)
         else:
             out.append(f"{p['name']}: {p['litres']:,.2f} L @ ₱{p['price']:.2f}/L")
     if bad:
         out.append("\nNot saved for the pump(s) above. Retake the photo, or reply with the meter value:")
-        out += [f"{p['name']} <litres> {p['price']:.2f}" for p in bad]
+        out += [f"{p['name']} <litres> {p['price']:.2f}" if p["price"] else f"{p['name']} <litres> <price>" for p in bad]
     return "\n".join(out)
 
 
