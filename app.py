@@ -1,6 +1,7 @@
 """PaddleOCR (PP-OCRv4 via ONNX Runtime) API + Telegram bot, sized for Render's free tier (512 MB RAM)."""
 import hashlib
 import os
+import re
 import threading
 from contextlib import asynccontextmanager
 
@@ -19,6 +20,8 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_ALLOWED = {c.strip() for c in os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
 TG_SECRET = hashlib.sha256(TG_TOKEN.encode()).hexdigest()[:32] if TG_TOKEN else ""
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+USE_CLS = os.getenv("USE_CLS", "0") == "1"  # off: the rotate step flips LCD digits (97.50 -> "0516")
+PUMP_LABELS = [x.strip() for x in os.getenv("PUMP_LABELS", "Regular,Premium 95,Diesel").split(",")]
 PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # set automatically by Render
 
 # One thread each: free tier has 0.1 CPU; more threads only add memory.
@@ -62,12 +65,50 @@ def ocr_bytes(data: bytes) -> dict:
         s = MAX_SIDE / max(h, w)
         img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
     with lock:
-        result = engine(img)[0]
+        result = engine(img, use_cls=USE_CLS)[0]
     lines = [
         {"text": t, "confidence": round(float(c), 4), "box": [[int(x), int(y)] for x, y in b]}
         for b, t, c in (result or [])
     ]
     return {"text": "\n".join(l["text"] for l in lines), "lines": lines}
+
+
+NUM = re.compile(r"^\d{1,7}\.\d{2}$")
+STAMP = re.compile(r"(\d{4}/\d{2}/\d{2})\s*(\d{2}:\d{2})")
+
+
+def pump_readings(lines: list) -> str | None:
+    """Pump panel photo -> one line per pump. Top row of numbers = litres, row below = price."""
+    nums = []
+    for l in lines:
+        t = l["text"].replace(" ", "")
+        if NUM.match(t):
+            ys = [p[1] for p in l["box"]]
+            xs = [p[0] for p in l["box"]]
+            nums.append({"v": t, "x": sum(xs) / 4, "y": sum(ys) / 4, "h": max(ys) - min(ys)})
+    if len(nums) < 4:
+        return None
+    nums.sort(key=lambda n: n["y"])
+    rows, cur = [], [nums[0]]
+    for n in nums[1:]:
+        if abs(n["y"] - cur[-1]["y"]) < 0.6 * max(n["h"], cur[-1]["h"]):
+            cur.append(n)
+        else:
+            rows.append(cur)
+            cur = [n]
+    rows.append(cur)
+    if len(rows) < 2 or len(rows[0]) < 2 or len(rows[0]) != len(rows[1]):
+        return None
+    litres = sorted(rows[0], key=lambda n: n["x"])
+    prices = sorted(rows[1], key=lambda n: n["x"])
+    out = []
+    stamp = next((STAMP.search(l["text"].replace(" ", "")) for l in lines if STAMP.search(l["text"].replace(" ", ""))), None)
+    if stamp:
+        out.append(f"Reading: {stamp.group(1)} {stamp.group(2)}")
+    for i, (L, P) in enumerate(zip(litres, prices)):
+        name = PUMP_LABELS[i] if i < len(PUMP_LABELS) else f"Pump {i + 1}"
+        out.append(f"{name}: {float(L['v']):,.2f} L @ ₱{P['v']}/L")
+    return "\n".join(out)
 
 
 @app.get("/")
@@ -144,7 +185,8 @@ async def handle_message(msg: dict):
         await tg("sendChatAction", chat_id=chat_id, action="typing")
         data = await tg_download(file_id)
         result = await run_in_threadpool(ocr_bytes, data)
-        await tg_reply(chat_id, result["text"] or "No text found.", mid)
+        reply = pump_readings(result["lines"]) or result["text"] or "No text found."
+        await tg_reply(chat_id, reply, mid)
     except Exception as e:
         print("telegram OCR error:", repr(e))
         await tg_reply(chat_id, "Sorry, I couldn't read that image. Try a clearer photo.", mid)

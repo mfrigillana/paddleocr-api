@@ -27,6 +27,8 @@ Send the bot a photo; it replies with the text.
 | DET_LIMIT | 736 | Detector input size. Raising it raises RAM. |
 | MAX_BYTES | 8388608 | Upload limit. |
 | TELEGRAM_BOT_TOKEN | (none) | Enables the bot. |
+| PUMP_LABELS | Regular,Premium 95,Diesel | Pump names, left to right, for pump-panel photos. |
+| USE_CLS | 0 | 1 = auto-rotate text. Leave off for LCD digits. |
 | TELEGRAM_ALLOWED_CHAT_IDS | (none) | Comma-separated. Empty = anyone can use it. |
 
 ## Free tier limits
