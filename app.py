@@ -22,6 +22,7 @@ TG_SECRET = hashlib.sha256(TG_TOKEN.encode()).hexdigest()[:32] if TG_TOKEN else 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 USE_CLS = os.getenv("USE_CLS", "0") == "1"  # off: the rotate step flips LCD digits (97.50 -> "0516")
 PUMP_LABELS = [x.strip() for x in os.getenv("PUMP_LABELS", "Regular,Premium 95,Diesel").split(",")]
+SHEET_URL = os.getenv("GSHEET_WEBHOOK_URL", "")  # Apps Script web app /exec URL
 PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # set automatically by Render
 
 # One thread each: free tier has 0.1 CPU; more threads only add memory.
@@ -77,8 +78,8 @@ NUM = re.compile(r"^\d{1,7}\.\d{2}$")
 STAMP = re.compile(r"(\d{4}/\d{2}/\d{2})\s*(\d{2}:\d{2})")
 
 
-def pump_readings(lines: list) -> str | None:
-    """Pump panel photo -> one line per pump. Top row of numbers = litres, row below = price."""
+def pump_readings(lines: list) -> dict | None:
+    """Pump panel photo -> {reading_time, pumps:[{name, litres, price}]}. Top row = litres, row below = price."""
     nums = []
     for l in lines:
         t = l["text"].replace(" ", "")
@@ -101,14 +102,47 @@ def pump_readings(lines: list) -> str | None:
         return None
     litres = sorted(rows[0], key=lambda n: n["x"])
     prices = sorted(rows[1], key=lambda n: n["x"])
-    out = []
-    stamp = next((STAMP.search(l["text"].replace(" ", "")) for l in lines if STAMP.search(l["text"].replace(" ", ""))), None)
-    if stamp:
-        out.append(f"Reading: {stamp.group(1)} {stamp.group(2)}")
-    for i, (L, P) in enumerate(zip(litres, prices)):
-        name = PUMP_LABELS[i] if i < len(PUMP_LABELS) else f"Pump {i + 1}"
-        out.append(f"{name}: {float(L['v']):,.2f} L @ ₱{P['v']}/L")
+    stamp = None
+    for l in lines:
+        m = STAMP.search(l["text"].replace(" ", ""))
+        if m:
+            stamp = f"{m.group(1)} {m.group(2)}"
+            break
+    pumps = [{"name": PUMP_LABELS[i] if i < len(PUMP_LABELS) else f"Pump {i + 1}",
+              "litres": float(L["v"]), "price": float(P["v"])}
+             for i, (L, P) in enumerate(zip(litres, prices))]
+    return {"reading_time": stamp, "pumps": pumps}
+
+
+def format_readings(r: dict) -> str:
+    out = [f"Reading: {r['reading_time']}"] if r["reading_time"] else []
+    out += [f"{p['name']}: {p['litres']:,.2f} L @ ₱{p['price']:.2f}/L" for p in r["pumps"]]
     return "\n".join(out)
+
+
+async def log_to_sheet(r: dict, msg: dict) -> str:
+    """POST readings to the Google Apps Script web app. Returns a short status line for the reply."""
+    if not SHEET_URL:
+        return ""
+    sender = msg.get("from") or {}
+    payload = {**r, "message_id": f"tg{msg['chat']['id']}_{msg.get('message_id')}",
+               "sent_by": sender.get("username") or sender.get("first_name") or ""}
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            res = (await c.post(SHEET_URL, json=payload)).json()
+    except Exception as e:
+        print("sheet log failed:", repr(e))
+        return "\n\nNot saved to sheet (connection error)."
+    if not res.get("ok"):
+        print("sheet log error:", res)
+        return "\n\nNot saved to sheet."
+    if res.get("duplicate"):
+        return "\n\nAlready in sheet."
+    lines = ["\n\nSaved to sheet."]
+    for s in res.get("sold", []):
+        if s.get("litres") != "":
+            lines.append(f"{s['pump']} since last: {s['litres']:,.2f} L = ₱{s['sales']:,.2f}")
+    return "\n".join(lines)
 
 
 @app.get("/")
@@ -185,7 +219,11 @@ async def handle_message(msg: dict):
         await tg("sendChatAction", chat_id=chat_id, action="typing")
         data = await tg_download(file_id)
         result = await run_in_threadpool(ocr_bytes, data)
-        reply = pump_readings(result["lines"]) or result["text"] or "No text found."
+        r = pump_readings(result["lines"])
+        if r:
+            reply = format_readings(r) + await log_to_sheet(r, msg)
+        else:
+            reply = result["text"] or "No text found."
         await tg_reply(chat_id, reply, mid)
     except Exception as e:
         print("telegram OCR error:", repr(e))

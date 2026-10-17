@@ -29,6 +29,7 @@ Send the bot a photo; it replies with the text.
 | TELEGRAM_BOT_TOKEN | (none) | Enables the bot. |
 | PUMP_LABELS | Regular,Premium 95,Diesel | Pump names, left to right, for pump-panel photos. |
 | USE_CLS | 0 | 1 = auto-rotate text. Leave off for LCD digits. |
+| GSHEET_WEBHOOK_URL | (none) | Apps Script web app /exec URL. Pump readings get logged there (see Code.gs). |
 | TELEGRAM_ALLOWED_CHAT_IDS | (none) | Comma-separated. Empty = anyone can use it. |
 
 ## Free tier limits
