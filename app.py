@@ -164,10 +164,15 @@ def _candidates(texts: list, first_conf: float, exp_digits: int | None = None) -
     return [(v, sc, f) for v, (sc, f) in out.items()]
 
 
-def _pick(cands: list, hist: list, t_ms: int):
+def _pick(cands: list, hist: list, t_ms: int, dated: bool = True):
     """Choose the reading that fits the meter history (meters only go up, by a plausible amount)."""
     if not cands:
         return None, "unreadable"
+    if hist and not dated:
+        # Undated photo: it may be any age, so only rule out the impossible. The sheet estimates its date.
+        lo, hi = min(v for _, v in hist) - MAX_PER_DAY * 365, max(v for _, v in hist) + MAX_PER_DAY * 30
+        good = sorted((c for c in cands if lo <= c[0] <= hi), key=lambda c: c[1])
+        return (good[0], None) if good else (None, "doesn't fit the previous reading")
     if hist:
         before = [v for t, v in hist if t < t_ms]
         after = [v for t, v in hist if t > t_ms]
@@ -197,7 +202,7 @@ def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | Non
     Prices are the anchor (they read reliably); each pump's litres is the number directly above its price."""
     toks = [_tok(l) for l in lines]
     for t in toks:  # LCD price read without its decimal point, e.g. "9700" -> "97.00"
-        if re.fullmatch(r"\d{4}", t["t"]) and 2000 <= int(t["t"]) <= 30000:
+        if re.fullmatch(r"\d{4,5}", t["t"]) and 2000 <= int(t["t"]) <= 20000:
             t["t"] = t["t"][:-2] + "." + t["t"][-2:]
     prices = [t for t in toks if PRICE.match(t["t"]) and 20 <= float(t["t"]) <= 300]
     if len(prices) < 2:
@@ -220,9 +225,20 @@ def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | Non
     row.sort(key=lambda t: t["cx"])
 
     # Fixed layout: left-to-right is always PUMP_LABELS (Regular, Premium, Diesel).
-    # If a pump's price wasn't found, place the others by which third of the photo they sit in.
+    # The meter screens (row of big numbers just above the prices) mark the columns. If a price
+    # wasn't read, each found price goes to the nearest meter column.
+    ph = sum(t["h"] for t in row) / len(row)
+    py = sum(t["cy"] for t in row) / len(row)
+    meters = [t for t in toks if t not in row and len(re.sub(r"\D", "", t["t"])) >= 6
+              and 0 < py - t["cy"] < 3.5 * ph]
+    meters.sort(key=lambda t: t["cx"])
+    cols = meters if len(meters) == n else None
     if len(row) == n:
         slots = list(range(n))
+    elif cols:
+        slots = [min(range(n), key=lambda i: abs(cols[i]["cx"] - P["cx"])) for P in row]
+        if len(set(slots)) != len(slots):
+            slots = list(range(len(row)))
     else:
         if width is None:
             width = (full.shape[1] * scale) if full is not None else max(t["x1"] for t in toks)
@@ -245,7 +261,11 @@ def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | Non
         return max(above, key=lambda t: t["cy"]) if above else None
 
     found = {}
-    for slot, P in zip(slots, row):
+    by_slot = dict(zip(slots, row))
+    for slot in range(n):
+        P = by_slot.get(slot)
+        if P is None and not cols:
+            continue
         name = PUMP_LABELS[slot]
         # How many digits this meter should show: from its history, else from other clean reads on the photo.
         h = (history or {}).get(name, [])
@@ -255,19 +275,19 @@ def pump_readings(lines: list, full=None, scale: float = 1.0, width: float | Non
             lens = [len(re.sub(r"\D", "", t["t"])) for t in (lit_tok(Q) for Q in row)
                     if t and NUM.match(t["t"]) and t["conf"] >= 0.9]
             exp = max(set(lens), key=lens.count) if lens else None
-        L = lit_tok(P)
+        L = lit_tok(P) if P is not None else cols[slot]
         choice, why = None, "not found"
         if L is not None:
             texts = [L["raw"]]
             if not (NUM.match(L["t"]) and L["conf"] >= 0.9):
                 texts += _reread(full, L, scale)
-            choice, why = _pick(_candidates(texts, L["conf"], exp), (history or {}).get(name, []), t_ms)
+            choice, why = _pick(_candidates(texts, L["conf"], exp), (history or {}).get(name, []), t_ms, bool(stamp))
             if choice is None and len(texts) == 1:  # clean read rejected by history: look again
                 texts += _reread(full, L, scale)
-                choice, why = _pick(_candidates(texts, L["conf"], exp), (history or {}).get(name, []), t_ms)
+                choice, why = _pick(_candidates(texts, L["conf"], exp), (history or {}).get(name, []), t_ms, bool(stamp))
         found[slot] = {"name": name, "litres": choice[0] if choice else None,
                        "filled": bool(choice and choice[2]), "why": why,
-                       "price": float(P["t"]), "raw": L["raw"] if L else ""}
+                       "price": float(P["t"]) if P is not None else None, "raw": L["raw"] if L else ""}
     pumps = [found.get(i, {"name": PUMP_LABELS[i], "litres": None, "price": None, "raw": ""})
              for i in range(n)]
     return {"reading_time": stamp, "pumps": pumps}
@@ -307,16 +327,19 @@ def format_readings(r: dict) -> str:
             else:
                 out.append(f"{p['name']}: couldn't read the meter" + (f" (saw \"{p['raw']}\")" if p.get("raw") else ""))
             bad.append(p)
+        elif p["price"] is None:
+            out.append(f"{p['name']}: {p['litres']:,.2f} L (couldn't read the price)")
+            bad.append(p)
         else:
             out.append(f"{p['name']}: {p['litres']:,.2f} L{'*' if p.get('filled') else ''} @ ₱{p['price']:.2f}/L")
     if any(p.get("filled") for p in r["pumps"]):
         out.append("* one faint digit was filled in to match the meter history")
     if bad:
-        if any(p.get("why") == "doesn't fit the previous reading" for p in bad) and not r["reading_time"]:
-            out.append("\nThis photo has no date stamp, so it was checked against the latest reading."
-                       " Older photos need the camera's date stamp.")
-        out.append("\nNot saved for the pump(s) above. Retake the photo, or reply with the meter value:")
-        out += [f"{p['name']} <litres> {p['price']:.2f}" if p["price"] else f"{p['name']} <litres> <price>" for p in bad]
+        out.append("\nNot saved for the pump(s) above. Retake the photo, or reply with:")
+        for p in bad:
+            lit = f"{p['litres']:.2f}" if p["litres"] is not None else "<litres>"
+            pr = f"{p['price']:.2f}" if p["price"] is not None else "<price>"
+            out.append(f"{p['name']} {lit} {pr}")
     return "\n".join(out)
 
 
@@ -337,7 +360,7 @@ async def log_to_sheet(r: dict, msg: dict) -> str:
     if not SHEET_URL:
         return ""
     sender = msg.get("from") or {}
-    r = {**r, "pumps": [p for p in r["pumps"] if p["litres"] is not None]}
+    r = {**r, "pumps": [p for p in r["pumps"] if p["litres"] is not None and p["price"] is not None]}
     if not r["pumps"]:
         return ""
     payload = {**r, "message_id": f"tg{msg['chat']['id']}_{msg.get('message_id')}",
@@ -354,6 +377,9 @@ async def log_to_sheet(r: dict, msg: dict) -> str:
     if res.get("duplicate"):
         return "\n\nAlready in sheet."
     lines = ["\n\nSaved to sheet."]
+    if res.get("source") == "estimated":
+        t = next((x.get("time") for x in res.get("sold", []) if x.get("time")), "")
+        lines.append(f"No date stamp on the photo, so the date was estimated from the meters: {t}")
     for s in res.get("sold", []):
         if s.get("litres") == "":
             continue
@@ -435,6 +461,7 @@ async def handle_message(msg: dict):
     if not file_id:
         r = manual_readings(msg.get("text") or "")
         if r:
+            r["typed"] = True
             await tg_reply(chat_id, format_readings(r) + await log_to_sheet(r, msg), mid)
         else:
             await tg_reply(chat_id, f"{HELP}\n\nYour chat ID: {chat_id}")
